@@ -1,0 +1,8 @@
+{
+    "type": "module",
+    "dependencies": {
+        "@aws-sdk/client-ses": "^3.846.0",
+        "express": "^5.1.0",
+        "node-fetch": "^3.3.2"
+    }
+}
