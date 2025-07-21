@@ -2,6 +2,9 @@
 import express from 'express';
 import fetch from 'node-fetch';
 
+import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+const sesClient = new SESClient({ region: "us-east-1" });
+
 // =========================
 // Jira Configuration
 // =========================
@@ -36,6 +39,51 @@ async function getBoardIdForProject(projectKey) {
     return data.values[0].id; // Use the first board found
   }
   return null;
+}
+
+// =========================
+// Utility: Get Current Sprint Dates for Board
+// =========================
+async function getCurrentSprintDates(boardId) {
+  const sprintsUrl = `${JIRA_BASE}/rest/agile/1.0/board/${boardId}/sprint?state=active`;
+  console.log('[getCurrentSprintDates] Fetching:', sprintsUrl);
+  const sprintsRes = await fetch(sprintsUrl, {
+    headers: {
+      'Authorization': `Basic ${JIRA_AUTH}`,
+      'Accept': 'application/json',
+    },
+  });
+  if (!sprintsRes.ok) {
+    const text = await sprintsRes.text();
+    console.error('[getCurrentSprintDates] Jira API error (sprints):', sprintsRes.status, text);
+    return {};
+  }
+  const sprintsBody = await sprintsRes.json();
+  console.log('[getCurrentSprintDates] Sprints response:', sprintsBody);
+  if (!sprintsBody.values || sprintsBody.values.length === 0) {
+    console.log('[getCurrentSprintDates] No active sprints found.');
+    return {};
+  }
+  const currentSprint = sprintsBody.values[0];
+
+  const sprintDetailsUrl = `${JIRA_BASE}/rest/agile/1.0/sprint/${currentSprint.id}`;
+  console.log('[getCurrentSprintDates] Fetching sprint details:', sprintDetailsUrl);
+  const sprintDetailsRes = await fetch(sprintDetailsUrl, {
+    headers: {
+      'Authorization': `Basic ${JIRA_AUTH}`,
+      'Accept': 'application/json',
+    },
+  });
+  if (!sprintDetailsRes.ok) {
+    const text = await sprintDetailsRes.text();
+    console.error('[getCurrentSprintDates] Jira API error (sprint details):', sprintDetailsRes.status, text);
+    return {};
+  }
+  const sprintDetails = await sprintDetailsRes.json();
+  console.log('[getCurrentSprintDates] Sprint details response:', sprintDetails);
+  const startDate = sprintDetails.startDate || sprintDetails.customfield_10015;
+  const endDate = sprintDetails.endDate || sprintDetails.duedate;
+  return { startDate, endDate };
 }
 
 // =========================
@@ -198,7 +246,90 @@ async function setSubtaskAssigneeToParent(subtaskKey, parentKey) {
 }
 
 // =========================
-// Webhook Endpoint
+// Email Notification
+// =========================
+async function sendEmailNotification({ issueKey, trigger, description }) {
+  console.log("[Email] Sending notification...", trigger, issueKey, description);
+  const recipients = (process.env.USER_EMAILS_FOR_NOTIFICATIONS || "").split(",").map(email => email.trim()).filter(Boolean);
+
+  console.log("[Email] Recipients:", recipients);
+
+  if (recipients.length === 0) {
+    console.log("[Email] No recipients configured. Skipping email notification.");
+    return;
+  }
+  
+  const params = {
+    Destination: {
+      ToAddresses: recipients
+    },
+    Message: {
+      Body: {
+        Text: {
+          Data: `Issue: ${issueKey}\nTrigger: ${trigger}\nAction: ${description}`,
+        },
+      },
+      Subject: {
+        Data: `Jira Automation Triggered for ${issueKey}`,
+      },
+    },
+    Source: process.env.SOURCE_EMAIL,
+  };
+
+  console.log("[Email] Sending email with params:", params);
+
+  try {
+    const result = await sesClient.send(new SendEmailCommand(params));
+    console.log("[Email] Sent notification:", result.MessageId);
+  } catch (err) {
+    console.error("[Email] Failed to send notification:", err);
+  }
+}
+
+// =========================
+// Slack Notification
+// =========================
+async function sendSlackNotification({ issueKey, trigger, description }) {
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  const issueUrl = `https://10xbeta.atlassian.net/browse/${issueKey}`;
+  if (!webhookUrl) {
+    console.log("[Slack] No webhook URL configured. Skipping notification.");
+    return;
+  }
+
+  const payload = {
+    text: `AWS-Jira Automation Triggered for <${issueUrl}|${issueKey}>`,
+    attachments: [
+      {
+        color: "#2c2d30",
+        fields: [
+          { title: "• Trigger", value: trigger, short: true },
+          { title: "• Action", value: description, short: false },
+        ],
+      },
+    ],
+  };
+
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`[Slack] Failed to send message: ${res.status} ${text}`);
+    } else {
+      console.log(`[Slack] Sent message for ${issueKey}`);
+    }
+  } catch (err) {
+    console.error('[Slack] Error sending message:', err);
+  }
+}
+
+// =========================
+// Webhook Endpoint & Lambda Handler
 // =========================
 app.post('/jira-webhook', async (req, res) => {
   const webhookEvent = req.body.webhookEvent;
@@ -208,13 +339,19 @@ app.post('/jira-webhook', async (req, res) => {
   const fields = issue && issue.fields;
   const changelog = req.body.changelog;
 
+  const issueType = fields && fields.issuetype;
+  const projectKey = fields && fields.project && fields.project.key;
+  
+  let description = "";
+
   // Issue created
   if (webhookEvent === 'jira:issue_created') {
-    const issueType = fields && fields.issuetype;
-    const projectKey = fields && fields.project && fields.project.key;
+    description = `An issue (${issueKey}) was created on Jira.`;
 
     if (issueType && issueType.subtask && fields && fields.parent && fields.parent.key) {
       await setSubtaskAssigneeToParent(issueKey, fields.parent.key);
+
+      description += `\n\nThis script updated subtask assignee from its parent (${fields.parent.key})`;
     }
 
     if (issueKey) {
@@ -222,8 +359,18 @@ app.post('/jira-webhook', async (req, res) => {
 
       if (startDate && endDate) {
         await setTaskDatesToSprint(issueKey, startDate, endDate);
+        
+        const formattedStart = new Date(startDate).toISOString().slice(0, 10);
+        const formattedEnd = new Date(endDate).toISOString().slice(0, 10);
+        description += `\n\nThis script updated start (${formattedStart}) & due (${formattedEnd}) dates for the issue (based on assigned sprint).\n`;
       }
     }
+
+    await sendNotificationEmail({
+      issueKey,
+      trigger: "jira:issue_created \n",
+      description
+    });
   }
     
   if (webhookEvent === 'jira:issue_updated' && changelog && changelog.items) {
@@ -234,6 +381,7 @@ app.post('/jira-webhook', async (req, res) => {
       const newSprintId = sprintChange.to;
 
       console.log('[Sprint Change] New sprint ID:', sprintChange.to, newSprintId);
+      description = `Sprint was updated for issue ${issueKey} on Jira.`;
 
       if (newSprintId) {
         console.log(`[Sprint Change] Detected sprint change for issue ${issueKey} → Sprint ID ${newSprintId}`);
@@ -253,13 +401,24 @@ app.post('/jira-webhook', async (req, res) => {
 
           if (startDate && endDate) {
             await setTaskDatesToSprint(issueKey, startDate, endDate);
+            
+            const formattedStart = new Date(startDate).toISOString().slice(0, 10);
+            const formattedEnd = new Date(endDate).toISOString().slice(0, 10);
+            description += `\n\nThis script updated start (${formattedStart}) and due (${formattedEnd}) dates for the issue (based on assigned sprint). `;
           } else {
             console.log(`[Sprint Change] No dates found in sprint ${newSprintId}`);
+            description += `\n\nThis script could not find start and end dates of the sprint.`;
           }
         } else {
           console.error(`[Sprint Change] Failed to fetch sprint details for ${newSprintId}`);
         }
       }
+
+      await sendNotificationEmail({
+        issueKey,
+        trigger: "jira:issue_updated \n",
+        description
+      });
     }
   }
 
