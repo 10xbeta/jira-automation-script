@@ -87,7 +87,7 @@ async function getCurrentSprintDates(boardId) {
 }
 
 // =========================
-// Utility: Get Sprint Dates
+// Utility: Get Active/Future Sprint Dates for Issue
 // =========================
 async function getSprintDates(issueKey) {
   console.log(`[getSprintDates] Checking sprint for issue: ${issueKey}`);
@@ -106,46 +106,51 @@ async function getSprintDates(issueKey) {
   }
 
   const issueData = await issueRes.json();
-  console.log('[getSprintDates] Issue data:', issueData);
   const sprintField = issueData.fields.customfield_10020;
+
+  console.log('[getSprintDates] Issue data:', issueData);
 
   if (!sprintField || sprintField.length === 0) {
     console.log(`[getSprintDates] No sprint assigned to issue ${issueKey}`);
     return {};
   }
 
-  const latestSprint = sprintField[sprintField.length - 1];
-  const sprintId = latestSprint.id;
+  // Check active then future sprint in precedence
+  for (const targetState of ['active', 'future']) {
+    for (let i = sprintField.length - 1; i >= 0; i--) {
+      const sprint = sprintField[i];
+      const sprintId = sprint.id;
 
-  if (!sprintId) {
-    console.log(`[getSprintDates] No sprint ID found in customfield_10020`);
-    return {};
+      if (!sprintId) continue;
+
+      const sprintUrl = `${JIRA_BASE}/rest/agile/1.0/sprint/${sprintId}`;
+      const sprintRes = await fetch(sprintUrl, {
+        headers: {
+          'Authorization': `Basic ${JIRA_AUTH}`,
+          'Accept': 'application/json',
+        },
+      });
+
+      if (!sprintRes.ok) {
+        console.error(`[getSprintDates] Failed to fetch sprint ${sprintId}:`, sprintRes.status, await sprintRes.text());
+        continue;
+      }
+
+      const sprintData = await sprintRes.json();
+      console.log('[getSprintDates] Sprint data:', sprintData);
+
+      if (sprintData.state?.toLowerCase() === targetState) {
+        const startDate = sprintData.startDate || sprintData.customfield_10015;
+        const endDate = sprintData.endDate || sprintData.duedate;
+
+        if (startDate && endDate) {
+          return { startDate, endDate };
+        }
+      }
+    }
   }
 
-  const sprintUrl = `${JIRA_BASE}/rest/agile/1.0/sprint/${sprintId}`;
-  const sprintRes = await fetch(sprintUrl, {
-    headers: {
-      'Authorization': `Basic ${JIRA_AUTH}`,
-      'Accept': 'application/json',
-    },
-  });
-
-  if (!sprintRes.ok) {
-    console.error(`[getSprintDates] Failed to fetch sprint ${sprintId}:`, sprintRes.status, await sprintRes.text());
-    return {};
-  }
-
-  const sprintData = await sprintRes.json();
-  console.log('[getSprintDates] Sprint data:', sprintData);
-
-  const startDate = sprintData.startDate || sprintData.customfield_10015;
-  const endDate = sprintData.endDate || sprintData.duedate;
-
-  if (startDate && endDate) {
-    return { startDate, endDate };
-  }
-
-  console.log(`[getSprintDates] Sprint ${sprintId} does not have start/end dates.`);
+  console.log(`[getSprintDates] No active or future sprint with valid dates found.`);
   return {};
 }
 
@@ -378,39 +383,18 @@ app.post('/jira-webhook', async (req, res) => {
     console.log('[Sprint Change] Sprint change:', sprintChange);
 
     if (sprintChange && sprintChange.to) {
-      const newSprintId = sprintChange.to;
-
-      console.log('[Sprint Change] New sprint ID:', sprintChange.to, newSprintId);
+      console.log('[Sprint Change] New sprint ID:', sprintChange.to);
       description = `Sprint was updated for issue ${issueKey} on Jira.`;
 
-      if (newSprintId) {
-        console.log(`[Sprint Change] Detected sprint change for issue ${issueKey} → Sprint ID ${newSprintId}`);
+      if (issueKey) {
+        const { startDate, endDate } = await getSprintDates(issueKey);
 
-        const sprintDetailsUrl = `${JIRA_BASE}/rest/agile/1.0/sprint/${newSprintId}`;
-        const sprintRes = await fetch(sprintDetailsUrl, {
-          headers: {
-            'Authorization': `Basic ${JIRA_AUTH}`,
-            'Accept': 'application/json',
-          },
-        });
-
-        if (sprintRes.ok) {
-          const sprintData = await sprintRes.json();
-          const startDate = sprintData.startDate || sprintData.customfield_10015;
-          const endDate = sprintData.endDate || sprintData.duedate;
-
-          if (startDate && endDate) {
-            await setTaskDatesToSprint(issueKey, startDate, endDate);
-            
-            const formattedStart = new Date(startDate).toISOString().slice(0, 10);
-            const formattedEnd = new Date(endDate).toISOString().slice(0, 10);
-            description += `\n\nThis script updated start (${formattedStart}) and due (${formattedEnd}) dates for the issue (based on assigned sprint). `;
-          } else {
-            console.log(`[Sprint Change] No dates found in sprint ${newSprintId}`);
-            description += `\n\nThis script could not find start and end dates of the sprint.`;
-          }
-        } else {
-          console.error(`[Sprint Change] Failed to fetch sprint details for ${newSprintId}`);
+        if (startDate && endDate) {
+          await setTaskDatesToSprint(issueKey, startDate, endDate);
+          
+          const formattedStart = new Date(startDate).toISOString().slice(0, 10);
+          const formattedEnd = new Date(endDate).toISOString().slice(0, 10);
+          description += `\n\nThis script updated start (${formattedStart}) & due (${formattedEnd}) dates for the issue (based on assigned sprint).\n`;
         }
       }
 
